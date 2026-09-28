@@ -1,0 +1,5 @@
+.env
+*.wav
+*.log
+last_call_*
+node_modules/

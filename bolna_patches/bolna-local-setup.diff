@@ -1,0 +1,343 @@
+diff --git a/bolna/agent_manager/task_manager.py b/bolna/agent_manager/task_manager.py
+index 82ae5a28..7a4795f0 100644
+--- a/bolna/agent_manager/task_manager.py
++++ b/bolna/agent_manager/task_manager.py
+@@ -5244,6 +5244,10 @@ class TaskManager(BaseManager):
+             # Normal WebSocket closure (code 1000)
+             pass
+         except Exception as e:
++            # Diagnostic only (2026-09-02): this used to log only str(e), which for a
++            # bare AttributeError like "'dict' object has no attribute 'strip'" gives no
++            # file/line - real cause is unknown until we capture one full traceback.
++            logger.error(f"_listen_transcriber full traceback:\n{traceback.format_exc()}")
+             provider = self.task_config["tools_config"]["transcriber"].get("provider")
+             model = self._component_model("transcriber")
+             await self._end_call_on_component_error(
+@@ -5260,7 +5264,19 @@ class TaskManager(BaseManager):
+             message["meta_info"]["transcriber_duration"] if "transcriber_duration" in message["meta_info"] else 0
+         )
+ 
+-        await self._handle_transcriber_output(next_task, message["data"], meta_info)
++        # Real bug found 2026-09-02 (first inbound call ever to reach this path - see
++        # _listen_transcriber traceback logging added the same day): a final transcript
++        # arrives here as message["data"] == {"type": "transcript", "content": "..."} -
++        # the sibling websocket-streaming branch above already unwraps this exact shape
++        # via message["data"].get("content") (line ~5113); this http-transcription branch
++        # skipped that step and handed the raw dict straight to _handle_transcriber_output,
++        # which does (transcriber_message or "").strip() and crashes with
++        # "'dict' object has no attribute 'strip'", killing the call every time.
++        transcriber_message = message["data"]
++        if isinstance(transcriber_message, dict):
++            transcriber_message = transcriber_message.get("content", "")
++
++        await self._handle_transcriber_output(next_task, transcriber_message, meta_info)
+ 
+     #################################################################
+     # Synthesizer task
+diff --git a/bolna/agent_types/contextual_conversational_agent.py b/bolna/agent_types/contextual_conversational_agent.py
+index c583598b..68b1f9ad 100644
+--- a/bolna/agent_types/contextual_conversational_agent.py
++++ b/bolna/agent_types/contextual_conversational_agent.py
+@@ -16,8 +16,22 @@ class StreamingContextualAgent(BaseAgent):
+     def __init__(self, llm):
+         super().__init__()
+         self.llm = llm
+-        self.conversation_completion_llm = OpenAiLLM(model=os.getenv("CHECK_FOR_COMPLETION_LLM", llm.model))
+-        self.voicemail_llm = OpenAiLLM(model=os.getenv("VOICEMAIL_DETECTION_LLM", "gpt-4.1-mini"))
++        # Real bug (not upstream, patched locally): these two sub-checks were
++        # unconditionally hardcoded to OpenAiLLM, requiring a real
++        # OPENAI_API_KEY even when the main conversational LLM is a fully
++        # self-hosted/free provider like Ollama (confirmed via a real failed
++        # call: "Missing credentials... OPENAI_API_KEY"). Default to reusing
++        # the already-configured main `llm` (same provider/model, works for
++        # any provider LiteLLM/OpenAiLLM supports) - only build a separate
++        # OpenAiLLM if the env var is explicitly set, preserving the original
++        # opt-in override behavior for anyone who does want a different model
++        # here.
++        self.conversation_completion_llm = (
++            OpenAiLLM(model=os.getenv("CHECK_FOR_COMPLETION_LLM")) if os.getenv("CHECK_FOR_COMPLETION_LLM") else llm
++        )
++        self.voicemail_llm = (
++            OpenAiLLM(model=os.getenv("VOICEMAIL_DETECTION_LLM")) if os.getenv("VOICEMAIL_DETECTION_LLM") else llm
++        )
+         self.history = [{"content": ""}]
+ 
+     async def check_for_completion(self, messages, check_for_completion_prompt, meta_info=None):
+diff --git a/bolna/enums.py b/bolna/enums.py
+index d53d8e30..e8f62e32 100644
+--- a/bolna/enums.py
++++ b/bolna/enums.py
+@@ -63,6 +63,7 @@ class SynthesizerProvider(str, Enum):
+     PIXA = "pixa"
+     MAYA = "maya"
+     KALPA = "kalpa"
++    OMNIVOICE = "omnivoice"
+ 
+     @classmethod
+     def all_values(cls):
+diff --git a/bolna/models.py b/bolna/models.py
+index 03d30d58..f77a297c 100644
+--- a/bolna/models.py
++++ b/bolna/models.py
+@@ -101,6 +101,17 @@ class SarvamConfig(BaseModel):
+     speed: Optional[float] = 1.0
+ 
+ 
++class OmniVoiceConfig(BaseModel):
++    """Self-hosted k2-fsa/OmniVoice (voice-agent/omnivoice_server.py) - not a cloud
++    API. voice_id/voice are labels only (the server always uses the fixed cloned
++    reference voice); language and speed are passed through per-request."""
++
++    voice_id: str
++    voice: str
++    language: str
++    speed: Optional[float] = 1.08
++
++
+ class PixaConfig(BaseModel):
+     voice_id: str
+     voice: str
+@@ -181,6 +192,7 @@ class Synthesizer(BaseModel):
+         OpenAIConfig,
+         MayaConfig,
+         KalpaConfig,
++        OmniVoiceConfig,
+     ] = Field(union_mode="smart")
+     stream: bool = False
+     buffer_size: Optional[int] = 40  # 40 characters in a buffer
+@@ -230,6 +242,9 @@ class Synthesizer(BaseModel):
+         elif provider == "kalpa":
+             if isinstance(config, dict):
+                 values["provider_config"] = KalpaConfig(**config)
++        elif provider == "omnivoice":
++            if isinstance(config, dict):
++                values["provider_config"] = OmniVoiceConfig(**config)
+ 
+         return values
+ 
+diff --git a/bolna/providers.py b/bolna/providers.py
+index 4984e4de..6bb1949c 100644
+--- a/bolna/providers.py
++++ b/bolna/providers.py
+@@ -12,6 +12,7 @@ from .synthesizer import (
+     PixaSynthesizer,
+     MayaSynthesizer,
+     KalpaSynthesizer,
++    OmniVoiceSynthesizer,
+ )
+ from .transcriber import (
+     DeepgramTranscriber,
+@@ -71,6 +72,7 @@ SUPPORTED_SYNTHESIZER_MODELS = {
+     SynthesizerProvider.PIXA.value: PixaSynthesizer,
+     SynthesizerProvider.MAYA.value: MayaSynthesizer,
+     SynthesizerProvider.KALPA.value: KalpaSynthesizer,
++    SynthesizerProvider.OMNIVOICE.value: OmniVoiceSynthesizer,
+ }
+ 
+ SUPPORTED_TRANSCRIBER_PROVIDERS = {
+diff --git a/bolna/synthesizer/__init__.py b/bolna/synthesizer/__init__.py
+index b3117fd5..f53fc19d 100644
+--- a/bolna/synthesizer/__init__.py
++++ b/bolna/synthesizer/__init__.py
+@@ -12,4 +12,5 @@ from .sarvam_synthesizer import SarvamSynthesizer
+ from .pixa_synthesizer import PixaSynthesizer
+ from .maya_synthesizer import MayaSynthesizer
+ from .kalpa_synthesizer import KalpaSynthesizer
++from .omnivoice_synthesizer import OmniVoiceSynthesizer
+ from .synthesizer_pool import SynthesizerPool
+diff --git a/local_setup/docker-compose.yml b/local_setup/docker-compose.yml
+index e58f49aa..70e587a1 100644
+--- a/local_setup/docker-compose.yml
++++ b/local_setup/docker-compose.yml
+@@ -5,8 +5,11 @@ services:
+   # main bolna service
+   bolna-app:
+     build:
+-      context: .
+-      dockerfile: dockerfiles/bolna_server.Dockerfile
++      # Repo root, not local_setup/ - so the Dockerfile can COPY the bolna/
++      # package source and install our local patches instead of pulling a
++      # fresh copy from git+https://github.com/bolna-ai/bolna@master.
++      context: ..
++      dockerfile: local_setup/dockerfiles/bolna_server.Dockerfile
+     image: bolna-app:latest  # This will tag the built image
+     ports:
+       - "5001:5001"
+@@ -38,6 +41,20 @@ services:
+       - ./ngrok-config.yml:/etc/ngrok.yml
+     ports:
+       - 4040:4040
++    depends_on:
++      - proxy
++
++  # Real fix (not upstream) for free-tier ngrok collapsing multiple tunnels
++  # onto one shared, round-robined domain - see dockerfiles/nginx.conf for
++  # the full explanation. Single entrypoint both ngrok tunnels point at;
++  # routes internally by path to bolna-app or plivo-app.
++  proxy:
++    image: nginx:alpine
++    volumes:
++      - ./dockerfiles/nginx.conf:/etc/nginx/conf.d/default.conf:ro
++    depends_on:
++      - bolna-app
++      - plivo-app
+ 
+   ### Telephony servers ###
+   twilio-app:
+@@ -49,7 +66,6 @@ services:
+       - "8001:8001"
+     depends_on:
+       - redis
+-      - ngrok
+       - bolna-app
+     env_file:
+       - .env
+@@ -63,7 +79,6 @@ services:
+       - "8002:8002"
+     depends_on:
+       - redis
+-      - ngrok
+       - bolna-app
+     env_file:
+       - .env
+diff --git a/local_setup/dockerfiles/bolna_server.Dockerfile b/local_setup/dockerfiles/bolna_server.Dockerfile
+index aca8975a..c6d0bb3f 100644
+--- a/local_setup/dockerfiles/bolna_server.Dockerfile
++++ b/local_setup/dockerfiles/bolna_server.Dockerfile
+@@ -34,14 +34,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
+     tqdm \
+     requests
+ 
+-# Install bolna package with verbose output for debugging
++# Install bolna from the LOCAL clone (not git+https://github.com/...) so
++# local patches actually take effect - see contextual_conversational_agent.py
++# for the real bug this was needed for (hardcoded OpenAI dependency in the
++# completion-check sub-agent). Build context is the repo root (see
++# docker-compose.yml) specifically so this COPY can reach the package source.
++COPY pyproject.toml requirements.txt* /app/bolna_src/
++COPY bolna /app/bolna_src/bolna
+ RUN --mount=type=cache,target=/root/.cache/pip \
+-    pip install --verbose git+https://github.com/bolna-ai/bolna@master || \
+-    (echo "Failed to install bolna package. See error above." && exit 1)
++    pip install --verbose /app/bolna_src || \
++    (echo "Failed to install local bolna package. See error above." && exit 1)
+ 
+ # Copy application files
+-COPY quickstart_server.py /app/
+-COPY presets /app/presets
++COPY local_setup/quickstart_server.py /app/
++COPY local_setup/presets /app/presets
++COPY local_setup/welcome_audio /app/welcome_audio
+ 
+ EXPOSE 5001
+ 
+diff --git a/local_setup/quickstart_server.py b/local_setup/quickstart_server.py
+index 9007089f..dbeac7ca 100644
+--- a/local_setup/quickstart_server.py
++++ b/local_setup/quickstart_server.py
+@@ -16,6 +16,62 @@ from bolna.agent_manager.assistant_manager import AssistantManager
+ load_dotenv()
+ logger = configure_logger(__name__)
+ 
++# Real bug found 2026-09-02 (killed a real live call, hangup_detail='llm_error'):
++# litellm.exceptions.MidStreamFallbackError.__init__ does
++# `int(original_status) if original_status is not None else 503` with no
++# fallback for a non-numeric value. Groq's openai/gpt-oss-20b occasionally
++# emits a tool call despite tool_choice=none configured (real Groq error:
++# "Tool choice is none, but model called a tool"), and litellm's own Groq
++# chunk_parser puts the non-numeric finish_reason 'tool_use_failed' into
++# original_exception.status_code, so int() crashes with ValueError and the
++# call is torn down. Sanitize the one bad input before it reaches litellm's
++# constructor rather than reimplementing litellm's own logic (avoids drifting
++# from upstream on the next litellm version bump).
++import litellm.exceptions as _litellm_exceptions
++
++_orig_midstream_fallback_init = _litellm_exceptions.MidStreamFallbackError.__init__
++
++
++def _safe_midstream_fallback_init(self, message, model, llm_provider, original_exception=None, **kwargs):
++    if original_exception is not None:
++        status = getattr(original_exception, "status_code", None)
++        if status is not None:
++            try:
++                int(status)
++            except (TypeError, ValueError):
++                logger.warning(
++                    f"MidStreamFallbackError: non-numeric status_code {status!r} on "
++                    f"{original_exception!r} - sanitizing to None so litellm's own 503 "
++                    f"fallback applies instead of crashing"
++                )
++                try:
++                    original_exception.status_code = None
++                except Exception:
++                    pass
++    _orig_midstream_fallback_init(self, message, model, llm_provider, original_exception=original_exception, **kwargs)
++
++
++_litellm_exceptions.MidStreamFallbackError.__init__ = _safe_midstream_fallback_init
++
++# Real bug found 2026-09-02: TaskManager.__forced_first_message only plays a
++# welcome greeting if self.preloaded_welcome_audio is already set (from a
++# "welcome_message_audio" kwarg) - there is no code path that synthesizes
++# agent_welcome_message TEXT at call time. Every call this session silently
++# skipped the greeting and marked it "played" anyway (task_manager.py:1482-1486);
++# what sounded like a greeting was always the LLM's reactive first turn after the
++# caller said "hello" first - on a real call where nobody speaks first, this is
++# pure silence on both ends. Pre-baked once via generate_welcome_audio.py (raw
++# s16le PCM @ 8kHz mono, base64, matching bolna.helpers.utils.resample's pcm
++# format contract) - regenerate that file and rebuild this image if
++# agent_welcome_message text changes.
++try:
++    with open("/app/welcome_audio/te_default.b64", "r", encoding="utf-8") as f:
++        CACHED_WELCOME_AUDIO_B64 = f.read().strip()
++    logger.info(f"Loaded cached welcome audio: {len(CACHED_WELCOME_AUDIO_B64)} base64 chars")
++except FileNotFoundError:
++    CACHED_WELCOME_AUDIO_B64 = None
++    logger.warning("No cached welcome audio found at /app/welcome_audio/te_default.b64")
++
+ redis_pool = redis.ConnectionPool.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+ redis_client = redis.Redis.from_pool(redis_pool)
+ active_websockets: List[WebSocket] = []
+@@ -186,7 +242,13 @@ async def websocket_endpoint(agent_id: str, websocket: WebSocket, user_agent: st
+         traceback.print_exc()
+         raise HTTPException(status_code=404, detail="Agent not found")
+ 
+-    assistant_manager = AssistantManager(agent_config, websocket, agent_id)
++    assistant_manager = AssistantManager(
++        agent_config,
++        websocket,
++        agent_id,
++        welcome_message_audio=CACHED_WELCOME_AUDIO_B64,
++        welcome_message_audio_sample_rate=8000,
++    )
+ 
+     try:
+         async for index, task_output in assistant_manager.run(local=True):
+diff --git a/local_setup/telephony_server/plivo_api_server.py b/local_setup/telephony_server/plivo_api_server.py
+index 6e2aa08d..3f9f5a42 100644
+--- a/local_setup/telephony_server/plivo_api_server.py
++++ b/local_setup/telephony_server/plivo_api_server.py
+@@ -73,8 +73,22 @@ async def make_call(request: Request):
+ 
+ 
+ @app.post("/plivo_connect")
+-async def plivo_connect(request: Request, bolna_host: str = Query(...), agent_id: str = Query(...)):
++async def plivo_connect(request: Request, bolna_host: str = Query(None), agent_id: str = Query(None)):
+     try:
++        # Outbound calls (via /call above) always pass both as query params. A real
++        # inbound call hits this exact URL with none - Plivo's Application answer_url
++        # is a static string with no query string (confirmed via a real inbound test
++        # that 422'd here before this fix: Plivo's Application config has never had
++        # a way to carry bolna_host, since it changes on every ngrok restart - see
++        # ngrok-config.yml, no reserved domain configured). Fall back to computing
++        # both live, the same way /call does, instead of hardcoding either anywhere.
++        if bolna_host is None:
++            _, bolna_host = populate_ngrok_tunnels()
++        if agent_id is None:
++            agent_id = os.getenv("DEFAULT_AGENT_ID")
++            if not agent_id:
++                raise HTTPException(status_code=500, detail="No agent_id in request and DEFAULT_AGENT_ID not set")
++
+         bolna_websocket_url = f"{bolna_host}/chat/v1/{agent_id}"
+ 
+         response = """
